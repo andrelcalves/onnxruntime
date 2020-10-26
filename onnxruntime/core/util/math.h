@@ -381,7 +381,7 @@ struct Im2colNd<T, StorageOrder::NHWC> {
 
         if (!accumulate_output) {
           if (is_padding) {
-            std::fill_n(data_img + index_im, input_channels, padding_value);
+            std::fill_n(data_col + index_col, input_channels, padding_value);
           } else {
             std::copy_n(data_img + index_im, input_channels, data_col + index_col);
           }

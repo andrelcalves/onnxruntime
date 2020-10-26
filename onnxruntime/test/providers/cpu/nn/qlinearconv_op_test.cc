@@ -334,6 +334,23 @@ class QLinearConvOpTester {
     return static_cast<T>(RoundHalfToEven(f) + requantize_values.zero_point_);
   }
 
+  static bool NextDimension(int64_t N, const int64_t* shape, int64_t* dims) {
+    // Loop over spatial axes in reverse order to choose an index, like counting.
+    bool incremented = false;
+    for (int64_t d_i = N - 1; d_i >= 0; --d_i) {
+      int64_t d_max = shape[d_i];
+      ORT_ENFORCE(dims[d_i] < d_max);
+      if (dims[d_i] == d_max - 1) {
+        dims[d_i] = 0;
+      } else {  // dims[d_i] < d_max - 1
+        ++dims[d_i];
+        incremented = true;
+        break;
+      }
+    }
+    return incremented;
+  }
+
   void ComputeExpectedOutput(std::vector<T1>& Y_data, std::vector<int64_t>& Y_shape) {
     ORT_ENFORCE(W_.shape_.size() > 2);
     ORT_ENFORCE(X_.shape_.size() == W_.shape_.size());
@@ -409,27 +426,56 @@ class QLinearConvOpTester {
           float weight_scale = W_.scale_[(W_.scale_.size() == 1) ? 0 : channel_index];
           float requantize_scale = (X_.scale_[0] * weight_scale) / output_scale_;
 
-          for (int64_t oh = 0; oh < output_h; oh++) {
-            for (int64_t ow = 0; ow < output_w; ow++) {
+          if (kernel_rank == 2) {
+            for (int64_t oh = 0; oh < output_h; oh++) {
+              for (int64_t ow = 0; ow < output_w; ow++) {
+                int32_t sum = bias;
+                const T1* input_image = Xdata;
+                const T2* weight_data = weight_row;
+                for (int64_t ic = 0; ic < group_input_channels; ic++) {
+                  for (int64_t kh = 0; kh < kernel_h; kh++) {
+                    int64_t ih = kh * dilation_h + oh * stride_h - pad_t;
+                    for (int64_t kw = 0; kw < kernel_w; kw++) {
+                      int64_t iw = kw * dilation_w + ow * stride_w - pad_l;
+                      int32_t w_value = static_cast<int32_t>(*weight_data++);
+                      if (static_cast<uint64_t>(ih) < static_cast<uint64_t>(input_h) &&
+                          static_cast<uint64_t>(iw) < static_cast<uint64_t>(input_w)) {
+                        int32_t x_value = static_cast<int32_t>(input_image[ih * input_w + iw]) - X_zero_point;
+                        sum += x_value * w_value;
+                      }
+                    }
+                  }
+                  input_image += input_image_size;
+                }
+                *Ydata++ = RequantizeOutput<T1>(sum, requantize_scale, requantize_values);
+              }
+            }
+          } else {
+            std::vector<int64_t> out_dims(kernel_rank, 0);
+            std::vector<int64_t> kernel_dims(kernel_rank, 0);
+            for (bool has_next_out = true; has_next_out;) {
               int32_t sum = bias;
               const T1* input_image = Xdata;
               const T2* weight_data = weight_row;
               for (int64_t ic = 0; ic < group_input_channels; ic++) {
-                for (int64_t kh = 0; kh < kernel_h; kh++) {
-                  int64_t ih = kh * dilation_h + oh * stride_h - pad_t;
-                  for (int64_t kw = 0; kw < kernel_w; kw++) {
-                    int64_t iw = kw * dilation_w + ow * stride_w - pad_l;
-                    int32_t w_value = static_cast<int32_t>(*weight_data++);
-                    if (static_cast<uint64_t>(ih) < static_cast<uint64_t>(input_h) &&
-                        static_cast<uint64_t>(iw) < static_cast<uint64_t>(input_w)) {
-                      int32_t x_value = static_cast<int32_t>(input_image[ih * input_w + iw]) - X_zero_point;
-                      sum += x_value * w_value;
-                    }
+                for (bool has_next_kernel = true; has_next_kernel;) {
+                  int64_t input_offset = 0;
+                  for (size_t axis = 0; axis < kernel_rank; ++axis) {
+                    int64_t input_dim = kernel_dims[axis] * dilations[axis] + out_dims[axis] * strides[axis] - pads[axis];
+                    input_offset *= input_shape[axis];
+                    input_offset += input_dim;
                   }
+                  int32_t w_value = static_cast<int32_t>(*weight_data++);
+                  int32_t x_value = static_cast<int32_t>(input_image[input_offset]) - X_zero_point;
+                  sum += x_value * w_value;
+
+                  has_next_kernel = NextDimension(kernel_rank, kernel_shape, kernel_dims.data());
                 }
                 input_image += input_image_size;
               }
               *Ydata++ = RequantizeOutput<T1>(sum, requantize_scale, requantize_values);
+
+              has_next_out = NextDimension(kernel_rank, output_shape, out_dims.data());
             }
           }
 
@@ -537,6 +583,16 @@ class QLinearConvOpTester {
     }
   }
 };
+
+TEST(QLinearConvTest, Conv3D_U8S8) {
+  QLinearConvOpTester<uint8_t, int8_t> test;
+  test.GenerateRandomInput({3, 24, 15, 11, 11}, .05f, 4);
+  test.GenerateRandomWeights({32, 24, 3, 3, 3}, .125f, 0);
+  test.GenerateRandomBias();
+  test.SetPads({1, 1, 1, 1, 1, 1});
+  test.SetOutputScaleAndZeroPoint(.55f, 54);
+  test.Run();
+}
 
 TEST(QLinearConvTest, Conv2D_U8S8) {
   QLinearConvOpTester<uint8_t, int8_t> test;
