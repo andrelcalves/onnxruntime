@@ -337,6 +337,95 @@ struct Im2colNd<T, StorageOrder::NCHW> {
   }
 };
 
+template <typename T>
+struct Im2colNd<T, StorageOrder::NHWC> {
+  void operator()(const T* data_img, const int64_t* im_shape, const int64_t* col_shape, int64_t /*img_size*/,
+                  int64_t /*col_size*/, const int64_t* kernel_shape, const int64_t* stride, const int64_t* dilation,
+                  const int64_t* pad, int64_t N, T* data_col, bool accumulate_output = false,
+                  T padding_value = 0) {
+    int64_t kernel_size = 1;
+    for (int64_t i = 0; i < N; ++i) {
+      kernel_size *= kernel_shape[i];
+    }
+
+    // channels_col = kernel size * input channels (effectively treat group = 1)
+    int64_t channels_col = col_shape[N];
+    int64_t input_channels = channels_col / kernel_size;
+
+    // iterate dimensions on output image shape (without Batch and Channel)
+    std::vector<int64_t> d_iter(N, 0);
+    // iterate inside each stop for kernel dimensions
+    std::vector<int64_t> d_inner(N, 0);
+
+    int64_t index_col = 0;
+    // Loop over spatial axes along the output image shape
+    for (bool incremented = true; incremented;) {
+      // Loop over spatial axes in reverse order to choose an index on kernel dimensions
+      for (bool has_next_inner = true; has_next_inner;) {
+        // Loop over spatial axes in forward order to compute the indices in the image
+        // and the inner col, and whether the index lies in the padding.
+        int64_t index_im = 0;
+        int64_t inner_col_index = 0;
+        bool is_padding = false;
+        for (int64_t d_i = 0; d_i < N; ++d_i) {
+          int64_t d_im = d_iter[d_i] * stride[d_i] - pad[d_i] + d_inner[d_i] * dilation[d_i];
+          is_padding |= d_im < 0 || d_im >= im_shape[d_i + 1];
+          index_im *= im_shape[d_i + 1];
+          index_im += d_im;
+          inner_col_index *= col_shape[d_i];
+          inner_col_index += d_inner[d_i];
+        }
+        index_im *= input_channels;
+        inner_col_index *= input_channels;
+        inner_col_index += index_col;
+
+        if (!accumulate_output) {
+          if (is_padding) {
+            std::fill_n(data_img + index_im, input_channels, padding_value);
+          } else {
+            std::copy_n(data_img + index_im, input_channels, data_col + index_col);
+          }
+        } else if (!is_padding) {
+          const T* ptr_im = data_img + index_im;
+          T* ptr_col = data_col + index_col;
+          for (int64_t i = 0; i < input_channels; ++i) {
+            *ptr_col++ = *ptr_im++;
+          }
+        }
+
+        has_next_inner = false;
+        for (int64_t d_i = N - 1; d_i >= 0; --d_i) {
+          int64_t d_max = kernel_shape[d_i];
+          ORT_ENFORCE(d_inner[d_i] < d_max);
+          if (d_inner[d_i] == d_max - 1) {
+            d_inner[d_i] = 0;
+          } else {  // d_inner[d_i] < d_max - 1
+            ++d_inner[d_i];
+            has_next_inner = true;
+            break;
+          }
+        }
+      }
+
+      // Loop over spatial axes in reverse order to choose an index,
+      // like counting.
+      incremented = false;
+      for (int64_t d_i = N - 1; d_i >= 0; --d_i) {
+        int64_t d_max = col_shape[d_i];
+        ORT_ENFORCE(d_iter[d_i] < d_max);
+        if (d_iter[d_i] == d_max - 1) {
+          d_iter[d_i] = 0;
+        } else {  // d_iter[d_i] < d_max - 1
+          ++d_iter[d_i];
+          incremented = true;
+          break;
+        }
+      }
+      index_col += channels_col;
+    }  // while(incremented) {
+  }
+};
+
 template <typename T, class Provider, int order>
 void Col2imNd(
     const T* data_col,
